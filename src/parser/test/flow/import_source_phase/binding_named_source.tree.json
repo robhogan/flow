@@ -1,0 +1,102 @@
+{
+  "body": [
+    {
+      "importKind": "value",
+      "loc": {
+        "end": {
+          "column": 35,
+          "line": 1
+        },
+        "source": null,
+        "start": {
+          "column": 0,
+          "line": 1
+        }
+      },
+      "phase": "source",
+      "range": [
+        0,
+        35
+      ],
+      "source": {
+        "loc": {
+          "end": {
+            "column": 34,
+            "line": 1
+          },
+          "source": null,
+          "start": {
+            "column": 26,
+            "line": 1
+          }
+        },
+        "range": [
+          26,
+          34
+        ],
+        "raw": "\"module\"",
+        "type": "Literal",
+        "value": "module"
+      },
+      "specifiers": [
+        {
+          "loc": {
+            "end": {
+              "column": 20,
+              "line": 1
+            },
+            "source": null,
+            "start": {
+              "column": 14,
+              "line": 1
+            }
+          },
+          "local": {
+            "loc": {
+              "end": {
+                "column": 20,
+                "line": 1
+              },
+              "source": null,
+              "start": {
+                "column": 14,
+                "line": 1
+              }
+            },
+            "name": "source",
+            "optional": false,
+            "range": [
+              14,
+              20
+            ],
+            "type": "Identifier",
+            "typeAnnotation": null
+          },
+          "range": [
+            14,
+            20
+          ],
+          "type": "ImportDefaultSpecifier"
+        }
+      ],
+      "type": "ImportDeclaration"
+    }
+  ],
+  "comments": [],
+  "loc": {
+    "end": {
+      "column": 35,
+      "line": 1
+    },
+    "source": null,
+    "start": {
+      "column": 0,
+      "line": 1
+    }
+  },
+  "range": [
+    0,
+    35
+  ],
+  "type": "Program"
+}

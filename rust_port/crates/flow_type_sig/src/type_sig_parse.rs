@@ -13248,6 +13248,9 @@ fn import_decl<'arena, 'ast>(
         default,
         specifiers,
         import_kind: kind,
+        // The source phase is not modelled in signatures yet; a source-phase
+        // import is signed as the plain default import it shadows.
+        phase: _,
         attributes: _,
         comments: _,
     } = decl;

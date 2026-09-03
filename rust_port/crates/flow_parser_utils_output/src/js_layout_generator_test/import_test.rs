@@ -64,6 +64,21 @@ fn test_basic() {
 }
 
 #[test]
+fn test_source_phase() {
+    assert_statement_string(false, None, r#"import source a from"a";"#);
+    assert_statement_string(true, None, r#"import source a from "a";"#);
+    assert_statement_string(true, None, r#"import source a from "a" with { type: "json" };"#);
+    // `source` as an ordinary binding name still prints without the phase.
+    assert_statement_string(true, None, r#"import source from "a";"#);
+    assert_statement_string(true, None, r#"import source, { b } from "a";"#);
+    assert_statement_string(true, None, r#"import source source from "a";"#);
+    // Dynamic form.
+    assert_statement_string(true, None, r#"import.source("a");"#);
+    assert_statement_string(true, None, r#"import.source("a", { with: { type: "json" } });"#);
+    assert_statement_string(true, None, r#"import("a");"#);
+}
+
+#[test]
 fn test_wrap_specifiers() {
     assert_statement_string(
         true,

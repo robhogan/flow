@@ -2680,7 +2680,7 @@ fn import_equals_module_reference(
     env: &mut ParserEnv,
 ) -> Result<statement::import_equals_declaration::ModuleReference<Loc, Loc>, Rollback> {
     let is_require_call = matches!(peek::token(env), TokenKind::TIdentifier { raw, .. } if raw == "require")
-        && peek::import_equals_module_reference_starts_require_call(env);
+        && peek::token_after_current_is_lparen(env);
     match peek::token(env) {
         TokenKind::TIdentifier { raw, .. } if raw == "require" && is_require_call => {
             // require("module")
@@ -4697,12 +4697,33 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
         }
     }
 
+    /// Rejects the binding forms a phase modifier does not accept. The source
+    /// phase takes only an `ImportedBinding`, so anything reaching here with a
+    /// phase — a namespace or a named specifier list — is an error. `defer`,
+    /// when it lands, accepts exactly the namespace form and so will want the
+    /// mirror of this check on the default-binding path.
+    fn check_phase_specifiers(
+        env: &mut ParserEnv,
+        phase: Option<statement::ImportPhase>,
+        specifier_loc: Loc,
+    ) -> Result<(), Rollback> {
+        match phase {
+            None => Ok(()),
+            Some(statement::ImportPhase::Source) => {
+                env.error_at(specifier_loc, ParseError::ImportSourcePhaseRequiresDefault)
+            }
+        }
+    }
+
     fn with_specifiers(
         env: &mut ParserEnv,
         import_kind: statement::ImportKind,
+        phase: Option<statement::ImportPhase>,
         leading: Vec<Comment<Loc>>,
     ) -> Result<StatementInner<Loc, Loc>, Rollback> {
+        let specifier_loc = peek::loc(env).dupe();
         let specifiers = named_or_namespace_specifier(env, import_kind)?;
+        check_phase_specifiers(env, phase, specifier_loc)?;
         let mut source = source(env)?;
         let attributes = import_attributes(env)?;
         let trailing = semicolon_and_trailing(env, &mut source)?;
@@ -4710,6 +4731,7 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
             loc: LOC_NONE,
             inner: Arc::new(statement::ImportDeclaration {
                 import_kind,
+                phase,
                 source,
                 specifiers,
                 default: None,
@@ -4722,6 +4744,7 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
     fn with_default(
         env: &mut ParserEnv,
         import_kind: statement::ImportKind,
+        phase: Option<statement::ImportPhase>,
         leading: Vec<Comment<Loc>>,
     ) -> Result<StatementInner<Loc, Loc>, Rollback> {
         let default_specifier = match import_kind {
@@ -4738,12 +4761,13 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
                 }
             }
         };
-        with_default_identifier(env, import_kind, leading, default_specifier)
+        with_default_identifier(env, import_kind, phase, leading, default_specifier)
     }
 
     fn with_default_identifier(
         env: &mut ParserEnv,
         import_kind: statement::ImportKind,
+        phase: Option<statement::ImportPhase>,
         leading: Vec<Comment<Loc>>,
         default_specifier: statement::import_declaration::DefaultIdentifier<Loc, Loc>,
     ) -> Result<StatementInner<Loc, Loc>, Rollback> {
@@ -4751,7 +4775,12 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
             TokenKind::TComma => {
                 // `import Foo, ...`
                 expect::token(env, TokenKind::TComma)?;
-                named_or_namespace_specifier(env, import_kind)?
+                let specifier_loc = peek::loc(env).dupe();
+                let specifiers = named_or_namespace_specifier(env, import_kind)?;
+                // `import source x, { y } from "m"` — the phase takes a lone
+                // default binding, so the extra specifiers are an error.
+                check_phase_specifiers(env, phase, specifier_loc)?;
+                specifiers
             }
             _ => None,
         };
@@ -4763,6 +4792,7 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
             loc: LOC_NONE,
             inner: Arc::new(statement::ImportDeclaration {
                 import_kind,
+                phase,
                 source,
                 specifiers: additional_specifiers,
                 default: Some(default_specifier),
@@ -4783,11 +4813,11 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
             match current_token {
                 TokenKind::TMult => {
                     // `import * as ns from "ModuleName";`
-                    with_specifiers(env, statement::ImportKind::ImportValue, leading)
+                    with_specifiers(env, statement::ImportKind::ImportValue, None, leading)
                 }
                 TokenKind::TLcurly => {
                     // `import { ... } from "ModuleName";`
-                    with_specifiers(env, statement::ImportKind::ImportValue, leading)
+                    with_specifiers(env, statement::ImportKind::ImportValue, None, leading)
                 }
                 // `import "ModuleName";`
                 TokenKind::TString(loc, value, raw, octal) => {
@@ -4798,6 +4828,7 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
                         loc: LOC_NONE,
                         inner: Arc::new(statement::ImportDeclaration {
                             import_kind: statement::ImportKind::ImportValue,
+                            phase: None,
                             source,
                             specifiers: None,
                             default: None,
@@ -4822,6 +4853,7 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
                         TokenKind::TComma => with_default_identifier(
                             env,
                             statement::ImportKind::ImportValue,
+                            None,
                             leading,
                             type_default,
                         ),
@@ -4831,6 +4863,7 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
                             with_default_identifier(
                                 env,
                                 statement::ImportKind::ImportValue,
+                                None,
                                 leading,
                                 type_default,
                             )
@@ -4850,10 +4883,10 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
                             }
                         }),
                         TokenKind::TMult => {
-                            with_specifiers(env, statement::ImportKind::ImportType, leading)
+                            with_specifiers(env, statement::ImportKind::ImportType, None, leading)
                         }
                         TokenKind::TLcurly => {
-                            with_specifiers(env, statement::ImportKind::ImportType, leading)
+                            with_specifiers(env, statement::ImportKind::ImportType, None, leading)
                         }
                         _ => {
                             // Check for import type Foo = ...
@@ -4881,6 +4914,7 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
                                 with_default_identifier(
                                     env,
                                     statement::ImportKind::ImportType,
+                                    None,
                                     leading,
                                     default_specifier,
                                 )
@@ -4893,10 +4927,102 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
                     expect::token(env, TokenKind::TTypeof)?;
                     match peek::token(env) {
                         TokenKind::TMult | TokenKind::TLcurly => {
-                            with_specifiers(env, statement::ImportKind::ImportTypeof, leading)
+                            with_specifiers(env, statement::ImportKind::ImportTypeof, None, leading)
                         }
-                        _ => with_default(env, statement::ImportKind::ImportTypeof, leading),
+                        _ => with_default(env, statement::ImportKind::ImportTypeof, None, leading),
                     }
+                }
+                // `import source x from "ModuleName";` — the source phase.
+                //
+                // `source` is contextual, so it is only the phase modifier
+                // when the import's binding follows it. `import source from
+                // "m"`, `import source, { x } from "m"` and `import source =
+                // require("m")` all still bind a local named `source`.
+                TokenKind::TIdentifier { ref raw, .. } if raw == "source" => {
+                    let source_id = main_parser::parse_identifier(env, None)?;
+                    let source_default = statement::import_declaration::DefaultIdentifier {
+                        identifier: source_id,
+                        remote_default_name_def_loc: None,
+                    };
+                    let after_source = peek::token(env).clone();
+                    match after_source {
+                        // `import source, { other } from "ModuleName";`
+                        TokenKind::TComma => with_default_identifier(
+                            env,
+                            statement::ImportKind::ImportValue,
+                            None,
+                            leading,
+                            source_default,
+                        ),
+                        // `import source = require("ModuleName");`
+                        TokenKind::TAssign => import_equals_declaration_with_id(
+                            env,
+                            statement::ImportKind::ImportValue,
+                            false,
+                            leading,
+                            source_default.identifier,
+                        )
+                        .map(|inner| {
+                            StatementInner::ImportEqualsDeclaration {
+                                loc: LOC_NONE,
+                                inner,
+                            }
+                        }),
+                        // `import source from ...`: the `from` is this
+                        // import's clause keyword when a module specifier
+                        // follows it, and the binding itself otherwise
+                        // (`import source from from "ModuleName";`).
+                        TokenKind::TIdentifier { ref raw, .. }
+                            if raw == "from" && peek::token_after_current_is_string(env) =>
+                        {
+                            with_default_identifier(
+                                env,
+                                statement::ImportKind::ImportValue,
+                                None,
+                                leading,
+                                source_default,
+                            )
+                        }
+                        // Phase modifier. The binding forms it does not accept
+                        // are still parsed, so that `import source * as ns from
+                        // "m"` reports the phase error rather than a cascade of
+                        // token errors.
+                        _ => {
+                            let phase = Some(statement::ImportPhase::Source);
+                            match peek::token(env) {
+                                TokenKind::TMult | TokenKind::TLcurly => with_specifiers(
+                                    env,
+                                    statement::ImportKind::ImportValue,
+                                    phase,
+                                    leading,
+                                ),
+                                _ => with_default(
+                                    env,
+                                    statement::ImportKind::ImportValue,
+                                    phase,
+                                    leading,
+                                ),
+                            }
+                        }
+                    }
+                }
+                // `import <phase> * as ns from "ModuleName";` for a phase
+                // this parser does not implement, `defer` being the one that
+                // exists today. An identifier followed by `*` can only be a
+                // phase modifier, so no phase is named here and any future one
+                // taking the namespace form is covered; the source phase is
+                // claimed by the arm above and never reaches this. Reporting
+                // and then parsing the namespace import anyway keeps it to one
+                // error rather than a cascade, and leaves an AST that differs
+                // from the intended one only in the evaluation timing.
+                TokenKind::TIdentifier { ref raw, .. }
+                    if peek::token_after_current_is_mult(env) =>
+                {
+                    let phase_loc = peek::loc(env).dupe();
+                    let phase = raw.to_string();
+                    eat::token(env)?;
+                    env.error_at(phase_loc, ParseError::ImportPhaseUnsupported(phase))?;
+                    with_specifiers(env, statement::ImportKind::ImportValue, None, leading)
                 }
                 // import Foo from "ModuleName"; or import Foo = ...
                 // Check for import equals: import Foo = ...
@@ -4924,6 +5050,7 @@ fn import_declaration(env: &mut ParserEnv) -> Result<statement::Statement<Loc, L
                         with_default_identifier(
                             env,
                             statement::ImportKind::ImportValue,
+                            None,
                             leading,
                             default_specifier,
                         )

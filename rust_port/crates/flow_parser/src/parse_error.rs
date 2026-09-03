@@ -116,6 +116,8 @@ pub enum ParseError {
     IllegalReturn,
     IllegalUnicodeEscape,
     ImportAttributeMissingComma,
+    ImportPhaseUnsupported(String),
+    ImportSourcePhaseRequiresDefault,
     ImportSpecifierMissingComma,
     ImportTypeShorthandOnlyInPureImport,
     IndexSignatureInvalidModifier(String),
@@ -513,6 +515,12 @@ impl fmt::Display for ParseError {
             }
             Self::ImportAttributeMissingComma => {
                 write!(f, "Missing comma between import attributes")
+            }
+            Self::ImportPhaseUnsupported(phase) => {
+                write!(f, "The `{}` import phase is not supported.", phase)
+            }
+            Self::ImportSourcePhaseRequiresDefault => {
+                write!(f, "Only `import source x from \"module\"` is valid")
             }
             Self::ImportSpecifierMissingComma => {
                 write!(f, "Missing comma between import specifiers")
