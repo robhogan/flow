@@ -108,8 +108,9 @@ function initFlowParserWASM(): void {
   // or record syntax opt in via their `.options.json`), an `enableTypes`
   // flag that mirrors OCaml's `types` option (on by default; fixtures that
   // need to exercise the no-type-grammar path opt out via `types: false`),
-  // a `sourceType` integer (0=unspecified, 1=script, 2=module), and a final
-  // zero to keep Flow's legacy comment syntax disabled. The Rust parser does
+  // a `sourceType` integer (0=unspecified, 1=script, 2=module), and an
+  // `enableTypesInComments` flag for Flow's legacy comment syntax (off by
+  // default - Hermes never supported it). The Rust parser does
   // docblock `@flow` pragma detection internally when
   // `enableTypesPragmaDetection` is set; the JS adapter `parse()` resolves
   // `flow: 'detect'` to that flag.
@@ -286,7 +287,11 @@ function parse(source: string, options: ParserOptions): Program | BabelFile {
       // (e.g. the wasm fixture runner) leave it off and supply
       // `enableTypes` directly.
       flag(options.enableTypesPragmaDetection),
-      0,
+      // `enableTypesInComments` opts into Flow's legacy comment syntax
+      // (`/*: T */`, `/*:: ... */`). Off by default: hermes-parser never
+      // supported it, and enabling it changes how existing sources parse,
+      // so callers that want the annotations must ask for them.
+      flag(options.enableTypesInComments),
       flag(options.babel),
       flag(options.transformOptions?.TransformEnumSyntax?.enable),
       flag(options.transformOptions?.TransformEnumSyntax?.getRuntime != null),

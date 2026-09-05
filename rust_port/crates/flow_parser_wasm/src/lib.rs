@@ -88,9 +88,11 @@ fn nonneg_u32(v: i32) -> u32 {
 ///   `/* */` comments, and directive-prologue string literals up to the
 ///   first non-directive token; in each collected comment it searches for
 ///   `@flow` followed by a non-word boundary.
-/// - enable_types_in_comments: ignored compatibility slot. This Hermes-compatible
-///   entry point always treats Flow's legacy comment syntax (`/*: T */`,
-///   `/*:: ... */`) as plain JavaScript comments.
+/// - enable_types_in_comments: enable Flow's legacy comment syntax (`/*: T */`,
+///   `/*:: ... */`); off by default. Hermes never supported comment syntax, so
+///   this entry point keeps it disabled unless a caller opts in. Gated on
+///   `types` by the parser (parser_env.rs:424), so it has no effect when the
+///   type grammar is off.
 /// - source_type: 0 = unspecified, 1 = script, 2 = module. flow_parser has
 ///   no script/module gate (parser_env.rs:218): `init_env` pins
 ///   `allow_yield: false, allow_await: false` at the top level
@@ -119,7 +121,7 @@ pub extern "C" fn hermesParse(
     enable_types: i32,
     source_type: i32,
     enable_types_pragma_detection: i32,
-    _enable_types_in_comments: i32,
+    enable_types_in_comments: i32,
     babel: i32,
     lower_enums: i32,
     custom_enum_runtime: i32,
@@ -205,7 +207,7 @@ pub extern "C" fn hermesParse(
         esproposal_decorators: enable_decorators != 0,
         types: resolved_enable_types,
         ambiguous_types: resolved_enable_ambiguous_types,
-        enable_types_in_comments: false,
+        enable_types_in_comments: enable_types_in_comments != 0,
         use_strict: false,
         assert_operator: assert_operator != 0,
         module_ref_prefix: None,
@@ -1033,6 +1035,44 @@ mod tests {
         result
     }
 
+    /// Exercise the FFI `hermesParse` entry point with the supplied
+    /// `enable_types_in_comments` flag. Test callers own the returned
+    /// pointer and must call `hermesParseResult_free`.
+    fn ffi_parse_with_types_in_comments(
+        source: &str,
+        enable_types_in_comments: i32,
+    ) -> *mut super::ParseResult {
+        let mut bytes = source.as_bytes().to_vec();
+        bytes.push(0);
+        let size = bytes.len();
+        let ptr = bytes.as_ptr();
+        let result = super::hermesParse(
+            ptr,
+            size,
+            std::ptr::null(),
+            0,
+            1, // enable_components
+            1, // enable_match
+            1, // enable_decorators
+            0, // tokens
+            0, // allow_return_outside
+            0, // assert_operator
+            1, // enable_enums
+            1, // enable_records
+            1, // enable_types
+            0, // source_type
+            0, // enable_types_pragma_detection
+            enable_types_in_comments,
+            0,  // babel
+            0,  // lower_enums
+            0,  // custom_enum_runtime
+            18, // react_runtime_target
+            1,  // throw_on_parse_errors
+        );
+        drop(bytes);
+        result
+    }
+
     #[test]
     fn module_source_type_does_not_panic() {
         // Pre-fix this would panic with "source_type=2 (module) is not
@@ -1054,6 +1094,33 @@ mod tests {
         assert!(
             err_ptr.is_null(),
             "valid module input should not produce a parse error"
+        );
+        super::hermesParseResult_free(result);
+    }
+
+    // `enable_types_in_comments` was an ignored slot for as long as this
+    // entry point mirrored Hermes, which never supported Flow's comment
+    // syntax. It is now honored, so guard both directions: a malformed type
+    // inside `/*:: */` is inert when the flag is off and a parse error when
+    // it is on.
+    #[test]
+    fn types_in_comments_disabled_treats_annotations_as_comments() {
+        let result = ffi_parse_with_types_in_comments("let x = 1;\n/*:: type = ; */\n", 0);
+        assert!(!result.is_null(), "ParseResult pointer should be non-null");
+        assert!(
+            super::hermesParseResult_getError(result).is_null(),
+            "a malformed type in a comment must not be parsed when the flag is off"
+        );
+        super::hermesParseResult_free(result);
+    }
+
+    #[test]
+    fn types_in_comments_enabled_parses_annotations() {
+        let result = ffi_parse_with_types_in_comments("let x = 1;\n/*:: type = ; */\n", 1);
+        assert!(!result.is_null(), "ParseResult pointer should be non-null");
+        assert!(
+            !super::hermesParseResult_getError(result).is_null(),
+            "a malformed type in a comment must be a parse error when the flag is on"
         );
         super::hermesParseResult_free(result);
     }
