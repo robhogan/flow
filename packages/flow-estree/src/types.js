@@ -2043,7 +2043,9 @@ export interface DeclareExportDeclarationNamedWithDeclaration extends DeclareExp
     | DeclareNamespace
     | DeclareOpaqueType
     | DeclareVariable
-    | DeclareEnum;
+    | DeclareEnum
+    | InterfaceDeclaration
+    | TypeAlias;
   readonly default: false;
   readonly source: null;
   // default cannot have specifiers and a declaration

@@ -1598,6 +1598,22 @@ const getTransforms = (
                     exportKind: 'type',
                   },
                 ];
+              case 'InterfaceDeclaration':
+                return [
+                  {
+                    declaration: transform.InterfaceDeclaration(
+                      node.declaration,
+                    ),
+                    exportKind: 'type',
+                  },
+                ];
+              case 'TypeAlias':
+                return [
+                  {
+                    declaration: transform.TypeAlias(node.declaration),
+                    exportKind: 'type',
+                  },
+                ];
               case 'DeclareNamespace':
                 return [
                   {
