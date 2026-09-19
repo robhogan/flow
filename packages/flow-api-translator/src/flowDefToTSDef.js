@@ -937,30 +937,35 @@ const getTransforms = (
       declare: true,
       kind: 'const',
     },
-    {
-      type: 'TSTypeAliasDeclaration',
-      declare: true,
-      id: {
+    declareTypeofAlias(specifier),
+  ];
+
+  // `declare type NAME = typeof NAME;`
+  const declareTypeofAlias = (
+    name: string,
+  ): TSESTree.TSTypeAliasDeclaration => ({
+    type: 'TSTypeAliasDeclaration',
+    declare: true,
+    id: {
+      type: 'Identifier',
+      decorators: [],
+      name,
+      optional: false,
+      loc: DUMMY_LOC,
+    },
+    typeAnnotation: {
+      type: 'TSTypeQuery',
+      exprName: {
         type: 'Identifier',
         decorators: [],
-        name: specifier,
+        name,
         optional: false,
-        loc: DUMMY_LOC,
-      },
-      typeAnnotation: {
-        type: 'TSTypeQuery',
-        exprName: {
-          type: 'Identifier',
-          decorators: [],
-          name: specifier,
-          optional: false,
-          loc: DUMMY_LOC,
-        },
         loc: DUMMY_LOC,
       },
       loc: DUMMY_LOC,
     },
-  ];
+    loc: DUMMY_LOC,
+  });
 
   // Whether `name` is bound at the top level by a class declaration, which is
   // the one case where `typeof name` can be re-exported as `name` itself and
@@ -971,6 +976,22 @@ const getTransforms = (
       exportedVar != null &&
       exportedVar.defs.length === 1 &&
       exportedVar.defs[0].type === 'ClassName'
+    );
+  };
+
+  // Whether `name` is bound at the top level only by value declarations
+  // (`declare function`, including overloads, or `declare var`/`let`/`const`),
+  // so that a type alias of the same name can be declared alongside it without
+  // clashing. Imports are excluded: an import binding conflicts with any local
+  // declaration of its name.
+  const isDeclaredValue = (name: string): boolean => {
+    const exportedVar = topScope.set.get(name);
+    if (exportedVar == null || exportedVar.defs.length === 0) {
+      return false;
+    }
+    return (
+      exportedVar.defs.every(def => def.type === 'FunctionName') ||
+      (exportedVar.defs.length === 1 && exportedVar.defs[0].type === 'Variable')
     );
   };
 
@@ -2095,6 +2116,7 @@ const getTransforms = (
       node: FlowESTree.DeclareModuleExports,
     ):
       | TSESTree.TSExportAssignment
+      | [TSESTree.TSTypeAliasDeclaration, TSESTree.TSExportAssignment]
       | [
           TSESTree.VariableDeclaration,
           TSESTree.TSTypeAliasDeclaration,
@@ -2137,6 +2159,30 @@ const getTransforms = (
             name: type.argument.name,
           },
         };
+      }
+
+      // `typeof name` for a declared function or variable can be exported as
+      // `name` itself. It needs a same-named type alias to be usable in type
+      // positions, as a class is - TS keeps types and values in separate
+      // namespaces, so the alias doesn't clash with the value.
+      const typeofName =
+        type.type === 'TypeofTypeAnnotation' &&
+        type.argument.type === 'Identifier'
+          ? type.argument.name
+          : null;
+      if (typeofName != null && isDeclaredValue(typeofName)) {
+        return [
+          declareTypeofAlias(typeofName),
+          {
+            type: 'TSExportAssignment',
+            loc: DUMMY_LOC,
+            expression: {
+              type: 'Identifier',
+              loc: DUMMY_LOC,
+              name: typeofName,
+            },
+          },
+        ];
       }
 
       const SPECIFIER = '$$MODULE_EXPORTS$$';

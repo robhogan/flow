@@ -12,8 +12,7 @@ exports[`flowDefToTSDef export/module-exports/typeof/function 1`] = `
  */
 
 declare function foo(): void;
-declare const $$MODULE_EXPORTS$$: typeof foo;
-declare type $$MODULE_EXPORTS$$ = typeof $$MODULE_EXPORTS$$;
-export = $$MODULE_EXPORTS$$;
+declare type foo = typeof foo;
+export = foo;
 "
 `;
