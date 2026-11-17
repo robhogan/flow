@@ -186,29 +186,84 @@ impl Default for FileOptions {
 pub static node_modules_containers: LazyLock<RwLock<BTreeMap<FlowSmolStr, BTreeSet<FlowSmolStr>>>> =
     LazyLock::new(|| RwLock::new(BTreeMap::new()));
 
+/// Logical-to-real mappings recorded by the initial crawl.
+#[derive(Debug, Default)]
+struct SymlinkPaths {
+    /// Files reached through a symlink, keyed by the logical path the crawl reached them by.
+    files: HashMap<PathBuf, PathBuf>,
+    /// Directory symlinks the crawl did not follow, keyed by the logical path of the symlink. Each
+    /// value is a path the crawl reached the target by, which can itself need resolving.
+    dirs: HashMap<PathBuf, PathBuf>,
+}
+
+/// Bounds the number of directory aliases followed while resolving one path. A chain only grows
+/// when the crawl reached a symlink's target through another symlink.
+const MAX_DIR_ALIAS_STEPS: usize = 40;
+
+impl SymlinkPaths {
+    fn resolve<'a>(&self, path: &'a Path) -> Cow<'a, Path> {
+        let mut current = Cow::Borrowed(path);
+        for _ in 0..MAX_DIR_ALIAS_STEPS {
+            if let Some(real_path) = self.files.get(current.as_ref()) {
+                return Cow::Owned(real_path.clone());
+            }
+            if self.dirs.is_empty() {
+                break;
+            }
+            let Some((alias, target)) = current
+                .ancestors()
+                .find_map(|ancestor| self.dirs.get_key_value(ancestor))
+            else {
+                break;
+            };
+            let rest = current
+                .strip_prefix(alias)
+                .expect("an ancestor should be a prefix of its descendant");
+            current = Cow::Owned(if rest.as_os_str().is_empty() {
+                target.clone()
+            } else {
+                target.join(rest)
+            });
+        }
+        current
+    }
+}
+
 #[derive(Debug)]
 pub struct SymlinkMap {
-    building_paths: Mutex<Option<HashMap<PathBuf, PathBuf>>>,
-    complete_paths: OnceLock<HashMap<PathBuf, PathBuf>>,
+    building_paths: Mutex<Option<SymlinkPaths>>,
+    complete_paths: OnceLock<SymlinkPaths>,
 }
 
 impl Default for SymlinkMap {
     fn default() -> Self {
         Self {
-            building_paths: Mutex::new(Some(HashMap::new())),
+            building_paths: Mutex::new(Some(SymlinkPaths::default())),
             complete_paths: OnceLock::new(),
         }
     }
 }
 
 impl SymlinkMap {
-    fn insert(&self, path: PathBuf, real_path: PathBuf) {
-        self.building_paths
+    fn with_building_paths(&self, f: impl FnOnce(&mut SymlinkPaths)) {
+        f(self
+            .building_paths
             .lock()
             .expect("symlink map lock should not be poisoned")
             .as_mut()
-            .expect("paths cannot be inserted after the map is complete")
-            .insert(path, real_path);
+            .expect("paths cannot be inserted after the map is complete"))
+    }
+
+    fn insert(&self, path: PathBuf, real_path: PathBuf) {
+        self.with_building_paths(|paths| {
+            paths.files.insert(path, real_path);
+        });
+    }
+
+    fn insert_dir_alias(&self, alias: PathBuf, target: PathBuf) {
+        self.with_building_paths(|paths| {
+            paths.dirs.insert(alias, target);
+        });
     }
 
     pub fn mark_complete(&self) {
@@ -230,11 +285,8 @@ impl SymlinkMap {
     /// Returns `None` when the map is not complete (e.g. not a full init run).
     pub fn try_resolve<'a>(&self, normalized_path: &'a str) -> Option<Cow<'a, str>> {
         let paths = self.complete_paths.get()?;
-        let normalized_path_buf = Path::new(normalized_path);
-        let resolved = paths
-            .get(normalized_path_buf)
-            .map_or(normalized_path_buf, PathBuf::as_path);
-        Some(resolved_path(normalized_path, resolved))
+        let resolved = paths.resolve(Path::new(normalized_path));
+        Some(resolved_path(normalized_path, &resolved))
     }
 }
 
@@ -1022,6 +1074,37 @@ fn crawl_path_filter(
         && realpath_filter(options, path, all, include_libdef)
 }
 
+/// Whether the crawl skips the contents of the directory at `path`.
+fn crawl_prunes_dir(
+    options: &FileOptions,
+    can_prune: bool,
+    path: &Path,
+    all: bool,
+    include_libdef: bool,
+) -> bool {
+    can_prune && !wanted_filter(options, path, all, include_libdef)
+}
+
+/// Whether the crawl reads the directory at the real path `path` without following a symlink:
+/// it's in the crawl's scope, and neither it nor a directory above it in scope is pruned.
+fn crawl_reaches_dir(
+    options: &FileOptions,
+    real_root: &Path,
+    real_subdir: Option<&Path>,
+    path: &Path,
+    can_prune: bool,
+    all: bool,
+    include_libdef: bool,
+) -> bool {
+    let in_scope =
+        |dir: &Path| path_is_in_crawl_scope(options, real_root, real_subdir, dir, include_libdef);
+    in_scope(path)
+        && !path
+            .ancestors()
+            .take_while(|dir| in_scope(dir))
+            .any(|dir| crawl_prunes_dir(options, can_prune, dir, all, include_libdef))
+}
+
 /// Whether the initial full crawl covers a path, making an absent alias mapping conclusive.
 pub fn initial_crawl_covers_path(options: &FileOptions, root: &Path, path: &Path) -> bool {
     path_is_in_crawl_scope(options, root, None, path, true)
@@ -1077,18 +1160,61 @@ pub fn make_next_files(
     };
 
     let can_prune = can_prune_dir(&options);
+    // Following every directory symlink walks each real directory once per path to it, and never
+    // ends for symlink cycles, such as the ones pnpm creates by linking workspace packages into
+    // each other's node_modules. The crawl reports files reached through a symlink by their real
+    // path, so a symlink to a directory the crawl reaches anyway adds nothing, and isn't followed.
+    // It's recorded in the symlink map instead, for module resolution through it.
+    let real_root = Arc::new(cached_canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
+    let real_subdir = Arc::new(
+        subdir.map(|subdir| cached_canonicalize(subdir).unwrap_or_else(|_| subdir.to_path_buf())),
+    );
+    let skipped_dir_symlinks = Arc::new(Mutex::new(Vec::new()));
     let mut chunk = Vec::new();
     let mut symlink_ancestor_cache = HashMap::new();
     for starting_point_path in starting_point_paths {
         let duped_options = options.dupe();
+        let real_root = real_root.dupe();
+        let real_subdir = real_subdir.dupe();
+        let skipped_dir_symlinks = skipped_dir_symlinks.dupe();
         for entry in jwalk::WalkDir::new(starting_point_path)
             .skip_hidden(false)
             .sort(sort)
             .follow_links(true)
             .parallelism(jwalk::Parallelism::RayonNewPool(2))
             .process_read_dir(move |_depth, path, _read_dir_state, children| {
-                if can_prune && !wanted_filter(&duped_options, path, all, include_libdef) {
+                if crawl_prunes_dir(&duped_options, can_prune, path, all, include_libdef) {
                     children.clear();
+                }
+                for child in children.iter_mut() {
+                    let Ok(entry) = child else { continue };
+                    if entry.read_children.is_none() || !entry.path_is_symlink() {
+                        continue;
+                    }
+                    let link = entry.path();
+                    let Ok(target) = cached_canonicalize(&link) else {
+                        continue;
+                    };
+                    let crawled_under = if crawl_reaches_dir(
+                        &duped_options,
+                        &real_root,
+                        real_subdir.as_deref(),
+                        &target,
+                        can_prune,
+                        all,
+                        include_libdef,
+                    ) {
+                        Some(target)
+                    } else {
+                        None
+                    };
+                    if let Some(crawled_under) = crawled_under {
+                        entry.read_children = None;
+                        skipped_dir_symlinks
+                            .lock()
+                            .expect("skipped symlinks lock should not be poisoned")
+                            .push((link, crawled_under));
+                    }
                 }
             })
         {
@@ -1160,6 +1286,16 @@ pub fn make_next_files(
                     chunk = Vec::new();
                 }
             }
+        }
+    }
+    if let Some(symlink_map) = symlink_map {
+        let skipped_dir_symlinks = std::mem::take(
+            &mut *skipped_dir_symlinks
+                .lock()
+                .expect("skipped symlinks lock should not be poisoned"),
+        );
+        for (link, crawled_under) in skipped_dir_symlinks {
+            symlink_map.insert_dir_alias(link, crawled_under);
         }
     }
     if !chunk.is_empty() {
@@ -1786,6 +1922,113 @@ mod tests {
             super::normalize_path("/project/dist", "/lib/index.js"),
             "/lib/index.js"
         );
+    }
+
+    #[test]
+    fn symlink_paths_resolve_through_chained_dir_aliases() {
+        let mut paths = super::SymlinkPaths::default();
+        paths.files.insert(
+            "/project/link/file.js".into(),
+            "/outside/target/file.js".into(),
+        );
+        paths
+            .dirs
+            .insert("/project/other_link".into(), "/project/link".into());
+        paths.dirs.insert(
+            "/project/pkg/node_modules/dep".into(),
+            "/project/dep".into(),
+        );
+
+        let resolve = |path: &str| paths.resolve(Path::new(path)).into_owned();
+        assert_eq!(
+            resolve("/project/other_link/file.js"),
+            Path::new("/outside/target/file.js")
+        );
+        assert_eq!(
+            resolve("/project/pkg/node_modules/dep/src/index.js"),
+            Path::new("/project/dep/src/index.js")
+        );
+        assert_eq!(
+            resolve("/project/pkg/node_modules/dep"),
+            Path::new("/project/dep")
+        );
+        assert_eq!(
+            resolve("/project/unrelated.js"),
+            Path::new("/project/unrelated.js")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn make_next_files_lists_each_file_once_through_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "flow_make_next_files_symlink_cycles_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Every package links to every other one, as pnpm links workspace packages. Without
+        // deduplication the crawl visits each of the packages' permutations.
+        let packages = ["a", "b", "c", "d", "e"];
+        for package in packages {
+            let dir = tmp.join("packages").join(package);
+            std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+            std::fs::write(dir.join("index.js"), "").unwrap();
+            for other in packages.iter().filter(|other| **other != package) {
+                symlink(
+                    Path::new("../..").join(other),
+                    dir.join("node_modules").join(other),
+                )
+                .unwrap();
+            }
+        }
+        let root = super::cached_canonicalize(&tmp).unwrap();
+
+        let mut options = FileOptions {
+            module_file_exts: vec![".js".into()],
+            ..FileOptions::default()
+        };
+        options.includes.add_path(&root);
+        let symlink_map = super::SymlinkMap::default();
+        let mut files = Vec::new();
+        super::make_next_files(
+            &root,
+            None,
+            false,
+            true,
+            Arc::new(options),
+            false,
+            Some(&symlink_map),
+            |chunk| files.extend(chunk),
+        );
+        symlink_map.mark_complete();
+
+        files.sort();
+        let expected: Vec<_> = packages
+            .iter()
+            .map(|package| root.join("packages").join(package).join("index.js"))
+            .collect();
+        assert_eq!(files, expected);
+
+        let resolve = |path: &Path| {
+            symlink_map
+                .try_resolve(path.to_str().unwrap())
+                .unwrap()
+                .into_owned()
+        };
+        let a = root.join("packages/a");
+        assert_eq!(
+            resolve(&a.join("node_modules/b/index.js")),
+            root.join("packages/b/index.js").to_string_lossy()
+        );
+        assert_eq!(
+            resolve(&a.join("node_modules/b/node_modules/c/index.js")),
+            root.join("packages/c/index.js").to_string_lossy()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[cfg(windows)]
