@@ -1164,11 +1164,14 @@ pub fn make_next_files(
     // ends for symlink cycles, such as the ones pnpm creates by linking workspace packages into
     // each other's node_modules. The crawl reports files reached through a symlink by their real
     // path, so a symlink to a directory the crawl reaches anyway adds nothing, and isn't followed.
-    // It's recorded in the symlink map instead, for module resolution through it.
+    // It's recorded in the symlink map instead, for module resolution through it. So is a symlink
+    // to a directory the walk is already inside, which closes a cycle.
     let real_root = Arc::new(cached_canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
     let real_subdir = Arc::new(
         subdir.map(|subdir| cached_canonicalize(subdir).unwrap_or_else(|_| subdir.to_path_buf())),
     );
+    let logical_root = Arc::new(root.to_path_buf());
+    let logical_subdir = Arc::new(subdir.map(Path::to_path_buf));
     let skipped_dir_symlinks = Arc::new(Mutex::new(Vec::new()));
     let mut chunk = Vec::new();
     let mut symlink_ancestor_cache = HashMap::new();
@@ -1176,6 +1179,8 @@ pub fn make_next_files(
         let duped_options = options.dupe();
         let real_root = real_root.dupe();
         let real_subdir = real_subdir.dupe();
+        let logical_root = logical_root.dupe();
+        let logical_subdir = logical_subdir.dupe();
         let skipped_dir_symlinks = skipped_dir_symlinks.dupe();
         for entry in jwalk::WalkDir::new(starting_point_path)
             .skip_hidden(false)
@@ -1206,7 +1211,19 @@ pub fn make_next_files(
                     ) {
                         Some(target)
                     } else {
-                        None
+                        link.ancestors()
+                            .skip(1)
+                            .take_while(|dir| {
+                                path_is_in_crawl_scope(
+                                    &duped_options,
+                                    &logical_root,
+                                    logical_subdir.as_deref(),
+                                    dir,
+                                    include_libdef,
+                                )
+                            })
+                            .find(|dir| cached_canonicalize(dir).is_ok_and(|real| real == target))
+                            .map(Path::to_path_buf)
                     };
                     if let Some(crawled_under) = crawled_under {
                         entry.read_children = None;
