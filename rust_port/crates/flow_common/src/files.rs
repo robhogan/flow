@@ -1108,6 +1108,19 @@ fn crawl_reaches_dir(
             .any(|dir| crawl_prunes_dir(options, can_prune, dir, all, include_libdef))
 }
 
+/// The directory above `path`, on the walk from `walk_root`, whose real path is `real_path`. A
+/// symlink at `path` to `real_path` closes a cycle through it.
+fn walk_ancestor_with_real_path<'a>(
+    walk_root: &Path,
+    path: &'a Path,
+    real_path: &Path,
+) -> Option<&'a Path> {
+    path.ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(walk_root))
+        .find(|dir| cached_canonicalize(dir).is_ok_and(|dir| dir == real_path))
+}
+
 /// Whether the initial full crawl covers a path, making an absent alias mapping conclusive.
 pub fn initial_crawl_covers_path(options: &FileOptions, root: &Path, path: &Path) -> bool {
     path_is_in_crawl_scope(options, root, None, path, true, false)
@@ -1171,6 +1184,7 @@ pub fn make_next_files(
         let duped_options = options.dupe();
         let root_buf = root.to_path_buf();
         let subdir_buf = subdir.map(Path::to_path_buf);
+        let walk_root = starting_point_path.clone();
         let skipped_dir_symlinks = skipped_dir_symlinks.clone();
         for entry in jwalk::WalkDir::new(starting_point_path)
             .skip_hidden(false)
@@ -1183,28 +1197,39 @@ pub fn make_next_files(
                 }
                 // Files reached through a symlink are reported by their real path, so a symlink to a
                 // directory the crawl reads anyway adds nothing. Following it would also never end
-                // for a cycle, eg between packages linked into each other's node_modules.
+                // for a cycle, eg between packages linked into each other's node_modules. A symlink
+                // to a directory the walk is already inside closes a cycle, so isn't followed either.
                 for entry in children.iter_mut().flatten() {
-                    if entry.read_children.is_some()
-                        && entry.path_is_symlink()
-                        && let Ok(target) = cached_canonicalize(&entry.path())
-                        && crawl_reaches_dir(
-                            &duped_options,
-                            &root_buf,
-                            subdir_buf.as_deref(),
-                            &target,
-                            can_prune,
-                            all,
-                            include_libdef,
-                        )
+                    if entry.read_children.is_none() || !entry.path_is_symlink() {
+                        continue;
+                    }
+                    let link = entry.path();
+                    let Ok(target) = cached_canonicalize(&link) else {
+                        continue;
+                    };
+                    let crawled_under = if crawl_reaches_dir(
+                        &duped_options,
+                        &root_buf,
+                        subdir_buf.as_deref(),
+                        &target,
+                        can_prune,
+                        all,
+                        include_libdef,
+                    ) {
+                        target
+                    } else if let Some(dir) =
+                        walk_ancestor_with_real_path(&walk_root, &link, &target)
                     {
-                        entry.read_children = None;
-                        if let Some(skipped_dir_symlinks) = &skipped_dir_symlinks {
-                            skipped_dir_symlinks
-                                .lock()
-                                .expect("skipped symlinks lock should not be poisoned")
-                                .push((entry.path(), target));
-                        }
+                        dir.to_path_buf()
+                    } else {
+                        continue;
+                    };
+                    entry.read_children = None;
+                    if let Some(skipped_dir_symlinks) = &skipped_dir_symlinks {
+                        skipped_dir_symlinks
+                            .lock()
+                            .expect("skipped symlinks lock should not be poisoned")
+                            .push((link, crawled_under));
                     }
                 }
             })
@@ -1993,6 +2018,72 @@ mod tests {
                 packages.join("c/index.js")
             );
         }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn make_next_files_stops_at_symlink_cycles_outside_the_root() {
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "flow_make_next_files_symlink_cycles_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // The root is one package of a workspace whose other packages link to each other.
+        let packages = tmp.join("packages");
+        for (package, links) in [("a", &["b"][..]), ("b", &["c"]), ("c", &["b"])] {
+            let dir = packages.join(package);
+            std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+            std::fs::write(dir.join("index.js"), "").unwrap();
+            for link in links {
+                symlink(
+                    Path::new("../..").join(link),
+                    dir.join("node_modules").join(link),
+                )
+                .unwrap();
+            }
+        }
+        let packages = super::cached_canonicalize(&packages).unwrap();
+        let root = packages.join("a");
+
+        let mut options = FileOptions {
+            module_file_exts: vec![".js".into()],
+            ..FileOptions::default()
+        };
+        options.includes.add_path(&root);
+        let symlink_map = super::SymlinkMap::default();
+        let mut files = Vec::new();
+        super::make_next_files(
+            &root,
+            None,
+            false,
+            true,
+            Arc::new(options),
+            false,
+            Some(&symlink_map),
+            |chunk| files.extend(chunk),
+        );
+        symlink_map.mark_complete();
+
+        files.sort();
+        let expected: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|package| packages.join(package).join("index.js"))
+            .collect();
+        assert_eq!(files, expected);
+
+        let paths = symlink_map.complete_paths.get().unwrap();
+        let b = root.join("node_modules/b");
+        let cycle = b.join("node_modules/c/node_modules/b");
+        assert_eq!(paths.dirs.get(&cycle), Some(&b));
+        assert_eq!(
+            paths.resolve(&cycle.join("index.js")),
+            packages.join("b/index.js")
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
