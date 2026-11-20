@@ -88,6 +88,15 @@ pub fn cached_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
         .get_or_insert(path)
 }
 
+/// Forgets every cached canonicalization.
+pub fn clear_canonicalize_cache() {
+    if let Some(cache) = CANONICALIZE_CACHE.get() {
+        for shard in &cache.shards {
+            shard.lock().unwrap().clear();
+        }
+    }
+}
+
 fn resolved_path<'a>(original: &'a str, resolved: &Path) -> Cow<'a, str> {
     let Some(resolved) = resolved.to_str() else {
         return Cow::Borrowed(original);
@@ -1123,6 +1132,7 @@ pub fn make_next_files(
                     // Only under the root does the crawl report what's under a symlink by its real
                     // path.
                     let crawled_directly = entry.parent_path().starts_with(&root_buf)
+                        && target.starts_with(&root_buf)
                         && target.starts_with(&crawl_root)
                         // The crawl reports everything under the target itself.
                         && (duped_options.implicitly_include_root
@@ -1848,7 +1858,7 @@ mod tests {
 
     #[test]
     fn symlink_map_resolves_a_cycle_from_a_stale_canonicalization() {
-        // The canonicalize cache outlives a re-init, so links can map into each other.
+        // Directories replaced by symlinks mid-crawl can leave links mapping into each other.
         let map = super::SymlinkMap::default();
         map.insert("/root/a".into(), "/root/b/sub".into());
         map.insert("/root/b".into(), "/root/a/sub".into());

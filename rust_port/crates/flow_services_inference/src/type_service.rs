@@ -3154,6 +3154,8 @@ pub fn init_from_scratch(
     root: &Path,
     previous_env: Option<&Env>,
 ) -> (Env, bool /* libs_ok */) {
+    // Symlinks can have changed since they were canonicalized.
+    files::clear_canonicalize_cache();
     with_transaction("init", |_transaction| {
         let ordered_libs = files::ordered_and_unordered_lib_paths(&options.file_options);
         let file_opts = options.file_options.dupe();

@@ -24,3 +24,6 @@ link ../root/pkg ../other/to_root
 link .. ../other/sub/up
 
 assert_ok "$FLOW" ls --strip-root | sort
+
+printf "\nflow ls of a directory containing the root:\n"
+assert_ok "$FLOW" ls --strip-root --root . .. | sort
